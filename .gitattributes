@@ -1,0 +1,13 @@
+# Normalize text files and keep repository checkouts consistent across platforms.
+* text=auto eol=lf
+
+# Never apply text normalization or textual diffs to binary assets.
+*.doc binary
+*.docm binary
+*.docx binary
+*.dotm binary
+*.dotx binary
+*.exe binary
+*.pdf binary
+*.png binary
+*.zip binary
