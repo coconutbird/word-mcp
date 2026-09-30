@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # Live Word tests are #[ignore]d: runners have no desktop Microsoft Word.
+      - name: Test
+        run: cargo test --all-targets --locked
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure Rust
+        run: rustup toolchain install 1.88 --profile minimal
+      - name: Test
+        run: cargo +1.88 test --all-targets --locked

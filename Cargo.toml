@@ -1,0 +1,65 @@
+[package]
+name = "word-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local MCP server for saved DOCX documents and live Microsoft Word automation"
+
+[dependencies]
+anyhow = "1"
+quick-xml = "0.38"
+rmcp = { version = "3.5", default-features = false, features = [
+    "server",
+    "transport-io",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "io-std",
+    "signal",
+    "sync",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zip = { version = "6", default-features = false, features = [
+    "deflate-flate2-zlib-rs",
+] }
+
+[target.'cfg(windows)'.dependencies]
+cppvtable-com = { git = "https://github.com/coconutbird/cppvtable", features = [
+    "windows-compat",
+] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+all = { level = "warn", priority = -1 }
