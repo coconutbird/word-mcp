@@ -1,110 +1,111 @@
-//! Document operations: creation, preview and targeted paragraph edits.
-//!
-//! Edit operations return the patched main document XML; callers save it.
+//! `docx_edit`: change the text and paragraph structure of saved documents.
 
-use std::fs;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    CreateDocumentArgs, FormatParagraphArgs, InsertParagraphArgs, PreviewDocumentArgs,
-    ReplaceTextArgs,
-    package::{DOCUMENT_PART, Entry, encode_entries, write_atomic},
-    xml::{
-        Document, PARAGRAPH_PROPERTY_ORDER, Patch, RUN_PROPERTY_ORDER, WORD_NS, escaped,
-        expand_empty, paragraph_xml, patch, prepend_child, property_xml, text_xml, validate_text,
+    Definition,
+    package::edit,
+    xml::{Document, expand_empty, paragraph_xml, patch, text_xml, validate_text},
+};
+use crate::tool::{Effect, Output, parse, tool};
+
+const NAME: &str = "docx_edit";
+
+pub(super) const TOOL: Definition = Definition {
+    name: NAME,
+    tool: || {
+        tool::<Arguments>(
+            NAME,
+            "Edit a saved .docx: replace literal text across runs, insert or delete paragraphs. Paragraph indices are zero-based and include table paragraphs. Every edit keeps a backup.",
+            Effect::Destructive,
+        )
     },
+    call,
 };
 
-const CONTENT_TYPES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
-const RELATIONSHIPS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
-
-/// Create a minimal DOCX holding one paragraph per entry (at least one).
-pub(super) fn create(arguments: &CreateDocumentArgs) -> Result<Value> {
-    let empty = [String::new()];
-    let paragraphs = if arguments.paragraphs.is_empty() {
-        &empty[..]
-    } else {
-        &arguments.paragraphs
-    };
-    let body = paragraphs
-        .iter()
-        .map(|text| paragraph_xml(text, None))
-        .collect::<Result<String>>()?;
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><w:document xmlns:w=\"{WORD_NS}\"><w:body>{body}<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/></w:sectPr></w:body></w:document>"
-    );
-    Document::parse(&xml)?;
-    let entries = [
-        Entry {
-            name: "[Content_Types].xml".into(),
-            bytes: CONTENT_TYPES.to_vec(),
-            directory: false,
-        },
-        Entry {
-            name: "_rels/.rels".into(),
-            bytes: RELATIONSHIPS.to_vec(),
-            directory: false,
-        },
-        Entry {
-            name: DOCUMENT_PART.into(),
-            bytes: xml.into_bytes(),
-            directory: false,
-        },
-    ];
-    write_atomic(
-        &arguments.path,
-        &encode_entries(&entries)?,
-        None,
-        arguments.overwrite,
-    )?;
-    Ok(json!({"path":arguments.path,"created":true,"paragraph_count":paragraphs.len()}))
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Arguments {
+    /// Local .docx path.
+    #[schemars(length(min = 1))]
+    path: PathBuf,
+    operation: Operation,
 }
 
-/// Render escaped logical HTML, optionally saving it beside the document.
-pub(super) fn preview(arguments: &PreviewDocumentArgs, document: &Document) -> Result<Value> {
-    let body = document
-        .paragraphs
-        .iter()
-        .map(|paragraph| {
-            format!(
-                "<p>{}</p>",
-                escaped(&document.text(*paragraph)).replace('\n', "<br>")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Document preview</title><style>body{{max-width:52rem;margin:2rem auto;font-family:system-ui}}p{{white-space:pre-wrap}}</style></head><body>{body}</body></html>"
-    );
-    if let Some(output) = &arguments.output_path {
-        ensure!(
-            output
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("html")
-                    || extension.eq_ignore_ascii_case("htm")),
-            "preview output must use .html or .htm extension"
-        );
-        ensure!(
-            output != &arguments.path,
-            "preview cannot overwrite source document"
-        );
-        if output.exists() {
-            ensure!(
-                fs::canonicalize(output)? != fs::canonicalize(&arguments.path)?,
-                "preview cannot overwrite source document"
-            );
-        }
-        write_atomic(output, html.as_bytes(), None, arguments.overwrite)?;
-    }
-    Ok(
-        json!({"path":arguments.path,"html":html,"output_path":arguments.output_path,"preview_type":"logical_html"}),
-    )
+#[derive(Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum Operation {
+    /// Replace literal text, including matches split across runs; the replacement takes
+    /// the formatting of the run where the match starts.
+    Replace {
+        /// Literal text to find.
+        #[schemars(length(min = 1))]
+        find: String,
+        /// Replacement text.
+        replacement: String,
+        /// Restrict matching to this zero-based paragraph.
+        paragraph: Option<usize>,
+        /// Replace every match instead of only the first.
+        #[serde(default)]
+        all: bool,
+    },
+    /// Insert a paragraph before a zero-based index, or append when omitted.
+    InsertParagraph {
+        /// Paragraph text; `\n` becomes a line break and `\t` a tab.
+        text: String,
+        /// Zero-based paragraph index to insert before.
+        index: Option<usize>,
+        /// Paragraph style id, for example `Heading1`.
+        style: Option<String>,
+    },
+    /// Delete a paragraph. Refuses section breaks, anchored ranges, and the last
+    /// paragraph of the body or a table cell.
+    DeleteParagraph {
+        /// Zero-based paragraph index.
+        index: usize,
+    },
+}
+
+fn call(arguments: Value) -> Result<Output> {
+    let Arguments { path, operation } = parse(NAME, arguments)?;
+    Ok(edit(&path, |package| {
+        let (xml, document) = package.parse()?;
+        let (xml, result) = match operation {
+            Operation::Replace {
+                find,
+                replacement,
+                paragraph,
+                all,
+            } => {
+                let Some((xml, count)) =
+                    replace(&document, xml, &find, &replacement, paragraph, all)?
+                else {
+                    return Ok(json!({"replacements": 0}));
+                };
+                (xml, json!({"replacements": count}))
+            }
+            Operation::InsertParagraph { text, index, style } => (
+                insert(&document, xml, &text, index, style.as_deref())?,
+                json!({}),
+            ),
+            Operation::DeleteParagraph { index } => {
+                let (xml, deleted) = delete(&document, xml, index)?;
+                (xml, json!({"deleted_text": deleted}))
+            }
+        };
+        package.set_document(xml)?;
+        Ok(result)
+    })?
+    .into())
 }
 
 /// The element index of the zero-based paragraph `index`.
-fn paragraph_at(document: &Document, index: usize) -> Result<usize> {
+pub(super) fn paragraph_at(document: &Document, index: usize) -> Result<usize> {
     document
         .paragraphs
         .get(index)
@@ -113,24 +114,23 @@ fn paragraph_at(document: &Document, index: usize) -> Result<usize> {
 }
 
 /// Replace literal text across a paragraph's runs; `None` when nothing matched.
-pub(super) fn replace(
-    arguments: &ReplaceTextArgs,
+fn replace(
     document: &Document,
     xml: &str,
+    find: &str,
+    replacement: &str,
+    only: Option<usize>,
+    all: bool,
 ) -> Result<Option<(String, usize)>> {
-    let find = arguments.find.as_str();
     ensure!(!find.is_empty(), "find must not be empty");
-    validate_text(&arguments.replacement)?;
-    if let Some(index) = arguments.paragraph_index {
+    validate_text(replacement)?;
+    if let Some(index) = only {
         paragraph_at(document, index)?;
     }
     let mut changes = Vec::new();
     let mut count = 0;
     for (index, paragraph) in document.paragraphs.iter().copied().enumerate() {
-        if arguments
-            .paragraph_index
-            .is_some_and(|selected| index != selected)
-        {
+        if only.is_some_and(|selected| index != selected) {
             continue;
         }
         let text = document.text(paragraph);
@@ -140,7 +140,7 @@ pub(super) fn replace(
         }
         document.editable(paragraph)?;
         document.unanchored(paragraph)?;
-        if !arguments.replace_all {
+        if !all {
             matches.truncate(1);
         }
         let texts = document.texts(paragraph);
@@ -168,11 +168,7 @@ pub(super) fn replace(
                 let local_end = (end - low).min(high - low);
                 values[node].replace_range(
                     local_start..local_end,
-                    if node == first {
-                        &arguments.replacement
-                    } else {
-                        ""
-                    },
+                    if node == first { replacement } else { "" },
                 );
             }
         }
@@ -183,7 +179,7 @@ pub(super) fn replace(
             }
         }
         count += matches.len();
-        if !arguments.replace_all {
+        if !all {
             break;
         }
     }
@@ -195,17 +191,19 @@ pub(super) fn replace(
 
 /// Insert a paragraph before the zero-based `index`, or append before the body's
 /// section properties.
-pub(super) fn insert(
-    arguments: &InsertParagraphArgs,
+fn insert(
     document: &Document,
     xml: &str,
+    text: &str,
+    index: Option<usize>,
+    style: Option<&str>,
 ) -> Result<String> {
-    let index = arguments.index.unwrap_or(document.paragraphs.len());
+    let index = index.unwrap_or(document.paragraphs.len());
     ensure!(
         index <= document.paragraphs.len(),
         "paragraph index is out of bounds"
     );
-    let paragraph = paragraph_xml(&arguments.text, arguments.style.as_deref())?;
+    let paragraph = paragraph_xml(text, style)?;
     let body = &document.nodes[document.body];
     if body.self_closing() {
         return patch(
@@ -225,7 +223,7 @@ pub(super) fn insert(
 }
 
 /// Remove the zero-based paragraph, returning the new XML and the deleted text.
-pub(super) fn delete(document: &Document, xml: &str, index: usize) -> Result<(String, String)> {
+fn delete(document: &Document, xml: &str, index: usize) -> Result<(String, String)> {
     let paragraph = paragraph_at(document, index)?;
     document.editable(paragraph)?;
     document.unanchored(paragraph)?;
@@ -263,173 +261,164 @@ pub(super) fn delete(document: &Document, xml: &str, index: usize) -> Result<(St
     ))
 }
 
-/// A property element name and its XML.
-type Property = (&'static str, String);
+#[cfg(test)]
+mod tests {
+    use std::fs;
 
-/// Sort properties into their schema order.
-fn ordered(mut properties: Vec<Property>, order: &[&str]) -> Vec<Property> {
-    properties.sort_by_key(|(name, _)| rank(order, name));
-    properties
-}
+    use anyhow::{Context, Result};
+    use serde_json::{Value, json};
 
-fn rank(order: &[&str], property: &str) -> usize {
-    order
-        .iter()
-        .position(|name| *name == property)
-        .unwrap_or(usize::MAX)
-}
-
-fn joined(properties: &[Property]) -> String {
-    properties.iter().map(|(_, value)| value.as_str()).collect()
-}
-
-/// Set schema-ordered `properties` inside `parent`'s `name` container (`pPr` or
-/// `rPr`), replacing same-named properties and keeping all others.
-fn property_patches(
-    document: &Document,
-    xml: &str,
-    parent: usize,
-    name: &str,
-    properties: &[Property],
-    changes: &mut Vec<Patch>,
-) -> Result<()> {
-    if properties.is_empty() {
-        return Ok(());
-    }
-    let order = if name == "pPr" {
-        PARAGRAPH_PROPERTY_ORDER
-    } else {
-        RUN_PROPERTY_ORDER
+    use super::super::{
+        testing::{PRESERVED_BYTES, document_xml, fixture, preserved_part, run},
+        xml::{Document, WORD_NS},
     };
-    let Some(container) = document.child(parent, name) else {
-        let content = format!(
-            "<w:{name} xmlns:w=\"{WORD_NS}\">{}</w:{name}>",
-            joined(properties)
-        );
-        changes.push(prepend_child(xml, &document.nodes[parent], content)?);
-        return Ok(());
-    };
-    let node = &document.nodes[container];
-    if node.self_closing() {
-        changes.push((
-            node.start,
-            node.end,
-            expand_empty(xml, node, &joined(properties))?,
-        ));
-        return Ok(());
-    }
-    for (property, value) in properties {
-        if let Some(existing) = document.child(container, property) {
-            let existing = &document.nodes[existing];
-            changes.push((existing.start, existing.end, value.clone()));
-        } else {
-            let offset = document
-                .children(container)
-                .find(|(_, child)| child.word && rank(order, &child.name) > rank(order, property))
-                .map_or(node.close_start, |(_, child)| child.start);
-            changes.push((offset, offset, value.clone()));
-        }
-    }
-    Ok(())
-}
+    use super::*;
 
-/// Run properties requested by `format_paragraph`, in schema order.
-fn requested_run_properties(arguments: &FormatParagraphArgs) -> Result<Vec<Property>> {
-    let mut properties = Vec::new();
-    for (name, value) in [("b", arguments.bold), ("i", arguments.italic)] {
-        if let Some(value) = value {
-            properties.push((name, property_xml(name, if value { "1" } else { "0" })));
-        }
+    fn edit_op(path: &std::path::Path, operation: &Value) -> Result<Value> {
+        run("docx_edit", json!({"path": path, "operation": operation}))
     }
-    if let Some(value) = arguments.underline {
-        properties.push((
-            "u",
-            property_xml("u", if value { "single" } else { "none" }),
-        ));
-    }
-    if let Some(size) = arguments.font_size_pt {
-        ensure!(
-            size.is_finite() && (1.0..=1638.0).contains(&size) && (size * 2.0).fract() == 0.0,
-            "font size must be 1–1638 points in half-point increments"
-        );
-        properties.push(("sz", property_xml("sz", &format!("{:.0}", size * 2.0))));
-    }
-    if let Some(font) = &arguments.font_family {
-        validate_text(font)?;
-        ensure!(!font.is_empty(), "font family must not be empty");
-        let font = escaped(font);
-        properties.push((
-            "rFonts",
-            format!(
-                "<w:rFonts xmlns:w=\"{WORD_NS}\" w:ascii=\"{font}\" w:hAnsi=\"{font}\" w:eastAsia=\"{font}\" w:cs=\"{font}\"/>"
-            ),
-        ));
-    }
-    Ok(ordered(properties, RUN_PROPERTY_ORDER))
-}
 
-/// Paragraph properties requested by `format_paragraph`, in schema order.
-fn requested_paragraph_properties(arguments: &FormatParagraphArgs) -> Result<Vec<Property>> {
-    let mut properties = Vec::new();
-    if let Some(alignment) = arguments.alignment {
-        properties.push(("jc", property_xml("jc", alignment.val())));
+    fn text(path: &std::path::Path) -> Result<Value> {
+        Ok(run(
+            "docx_read",
+            json!({"path": path, "operation": {"action": "paragraphs"}}),
+        )?["text"]
+            .clone())
     }
-    if let Some(style) = &arguments.style {
-        validate_text(style)?;
-        properties.push(("pStyle", property_xml("pStyle", style)));
-    }
-    Ok(ordered(properties, PARAGRAPH_PROPERTY_ORDER))
-}
 
-/// Apply direct paragraph formatting and run formatting to every run.
-pub(super) fn format(
-    arguments: &FormatParagraphArgs,
-    document: &Document,
-    xml: &str,
-) -> Result<String> {
-    let paragraph = paragraph_at(document, arguments.index)?;
-    document.editable(paragraph)?;
-    let run_properties = requested_run_properties(arguments)?;
-    let paragraph_properties = requested_paragraph_properties(arguments)?;
-    ensure!(
-        !run_properties.is_empty() || !paragraph_properties.is_empty(),
-        "provide at least one formatting property"
-    );
-    let node = &document.nodes[paragraph];
-    let mut changes = Vec::new();
-    if node.self_closing() {
-        let content = format!(
-            "<w:pPr xmlns:w=\"{WORD_NS}\">{}</w:pPr><w:r xmlns:w=\"{WORD_NS}\"><w:rPr>{}</w:rPr><w:t/></w:r>",
-            joined(&paragraph_properties),
-            joined(&run_properties)
-        );
-        changes.push((node.start, node.end, expand_empty(xml, node, &content)?));
-    } else {
-        property_patches(
-            document,
-            xml,
-            paragraph,
-            "pPr",
-            &paragraph_properties,
-            &mut changes,
+    #[test]
+    fn split_runs_preserve_format_parts_and_original_backup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("split.docx");
+        fixture(
+            &path,
+            "<q:p><q:r><q:rPr><q:b/></q:rPr><q:t>café </q:t></q:r><q:r><q:rPr><q:i/></q:rPr><q:t>🍎 today café 🍎</q:t></q:r></q:p>",
         )?;
-        let runs: Vec<usize> = document
-            .owned(paragraph)
-            .filter_map(|(index, child)| (child.name == "r").then_some(index))
-            .collect();
-        for run in &runs {
-            property_patches(document, xml, *run, "rPr", &run_properties, &mut changes)?;
-        }
-        if runs.is_empty() && !run_properties.is_empty() {
-            changes.push((
-                node.close_start,
-                node.close_start,
-                format!(
-                    "<w:r xmlns:w=\"{WORD_NS}\"><w:rPr>{}</w:rPr><w:t/></w:r>",
-                    joined(&run_properties)
-                ),
-            ));
-        }
+        let original = fs::read(&path)?;
+        let result = edit_op(
+            &path,
+            &json!({"action": "replace", "find": "café 🍎", "replacement": "A & B", "all": true}),
+        )?;
+        assert_eq!(result["replacements"], 2);
+        let backup = result["backup_path"].as_str().context("missing backup")?;
+        assert_eq!(fs::read(backup)?, original);
+        let xml = document_xml(&path)?;
+        assert!(xml.contains("<q:b/>") && xml.contains("<q:i/>"));
+        assert_eq!(preserved_part(&path)?, PRESERVED_BYTES);
+        assert_eq!(text(&path)?, "A & B today A & B");
+        let unchanged = edit_op(
+            &path,
+            &json!({"action": "replace", "find": "absent", "replacement": "x"}),
+        )?;
+        assert_eq!(unchanged["modified"], false);
+        Ok(())
     }
-    patch(xml, changes)
+
+    #[test]
+    fn insert_empty_body_and_table_indices() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("table.docx");
+        fixture(
+            &path,
+            "<q:p><q:r><q:t>before</q:t></q:r></q:p><q:tbl><q:tr><q:tc><q:p><q:r><q:t>cell</q:t></q:r></q:p></q:tc></q:tr></q:tbl><q:sectPr/>",
+        )?;
+        edit_op(
+            &path,
+            &json!({"action": "insert_paragraph", "index": 1, "text": "inserted"}),
+        )?;
+        assert_eq!(text(&path)?, "before\ninserted\ncell");
+        let empty = format!("<q:document xmlns:q=\"{WORD_NS}\"><q:body/></q:document>");
+        let document = Document::parse(&empty)?;
+        let edited = insert(&document, &empty, "new", None, None)?;
+        let parsed = Document::parse(&edited)?;
+        assert_eq!(parsed.nodes[parsed.paragraphs[0]].parent, Some(parsed.body));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_paragraph_removes_only_target() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("delete.docx");
+        fixture(
+            &path,
+            "<q:p><q:r><q:t>keep one</q:t></q:r></q:p><q:p><q:r><q:rPr><q:b/></q:rPr><q:t>drop me</q:t></q:r></q:p><q:tbl><q:tr><q:tc><q:p><q:r><q:t>cell a</q:t></q:r></q:p><q:p><q:r><q:t>cell b</q:t></q:r></q:p></q:tc></q:tr></q:tbl><q:p><q:r><q:t>keep two</q:t></q:r></q:p><q:sectPr/>",
+        )?;
+        let original = fs::read(&path)?;
+        let result = edit_op(&path, &json!({"action": "delete_paragraph", "index": 1}))?;
+        assert_eq!(result["modified"], true);
+        assert_eq!(result["deleted_text"], "drop me");
+        let backup = result["backup_path"].as_str().context("missing backup")?;
+        assert_eq!(fs::read(backup)?, original);
+        assert_eq!(preserved_part(&path)?, PRESERVED_BYTES);
+        edit_op(&path, &json!({"action": "delete_paragraph", "index": 2}))?;
+        assert_eq!(text(&path)?, "keep one\ncell a\nkeep two");
+        assert!(!document_xml(&path)?.contains("<q:b/>"));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_paragraph_refusals_leave_document_unchanged() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("refuse.docx");
+        for (body, index) in [
+            ("<q:p><q:r><q:t>only</q:t></q:r></q:p><q:sectPr/>", 0),
+            (
+                "<q:p><q:r><q:t>body</q:t></q:r></q:p><q:tbl><q:tr><q:tc><q:p><q:r><q:t>cell</q:t></q:r></q:p></q:tc></q:tr></q:tbl><q:p/>",
+                1,
+            ),
+            (
+                "<q:p><q:pPr><q:sectPr/></q:pPr><q:r><q:t>section one</q:t></q:r></q:p><q:p><q:r><q:t>after</q:t></q:r></q:p><q:sectPr/>",
+                0,
+            ),
+            (
+                "<q:p><q:bookmarkStart q:id=\"1\"/><q:r><q:t>marked</q:t></q:r><q:bookmarkEnd q:id=\"1\"/></q:p><q:p/>",
+                0,
+            ),
+            (
+                "<q:p/><q:tbl><q:tr><q:tc><q:p/><q:tbl><q:tr><q:tc><q:p/></q:tc></q:tr></q:tbl><q:p/></q:tc></q:tr></q:tbl><q:p/>",
+                3,
+            ),
+            ("<q:p/><q:p/>", 2),
+        ] {
+            fixture(&path, body)?;
+            let before = fs::read(&path)?;
+            assert!(
+                edit_op(
+                    &path,
+                    &json!({"action": "delete_paragraph", "index": index})
+                )
+                .is_err(),
+                "deleted paragraph {index} of {body}"
+            );
+            assert_eq!(fs::read(&path)?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn locks_and_unsupported_edits_leave_original_unchanged() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("locked.docx");
+        fixture(&path, "<q:p><q:r><q:t>text</q:t></q:r></q:p>")?;
+        let original = fs::read(&path)?;
+        let replace = json!({"action": "replace", "find": "text", "replacement": "changed"});
+        for name in ["~$locked.docx", "~$cked.docx"] {
+            let lock = directory.path().join(name);
+            fs::write(&lock, [])?;
+            assert!(edit_op(&path, &replace).is_err());
+            assert_eq!(fs::read(&path)?, original);
+            fs::remove_file(lock)?;
+        }
+        for body in [
+            "<q:sdt><q:sdtContent><q:p><q:r><q:t>text</q:t></q:r></q:p></q:sdtContent></q:sdt>",
+            "<q:p><q:fldSimple q:instr=\"DATE\"><q:r><q:t>text</q:t></q:r></q:fldSimple></q:p>",
+            "<q:p><q:bookmarkStart q:id=\"1\"/><q:r><q:t>text</q:t></q:r><q:bookmarkEnd q:id=\"1\"/></q:p>",
+        ] {
+            fixture(&path, body)?;
+            let before = fs::read(&path)?;
+            assert!(edit_op(&path, &replace).is_err());
+            assert_eq!(fs::read(&path)?, before);
+        }
+        Ok(())
+    }
 }

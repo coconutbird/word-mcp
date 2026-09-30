@@ -46,7 +46,7 @@ const BUSY_DELAY: Duration = Duration::from_millis(100);
 
 /// The OLE Automation interface through which Word exposes its object model.
 #[interface(abi = com, iid = "00020400-0000-0000-C000-000000000046")]
-pub(super) unsafe trait IDispatch {
+pub(in crate::live) unsafe trait IDispatch {
     /// Report whether the object provides type information.
     ///
     /// # Safety
@@ -98,7 +98,7 @@ pub(super) unsafe trait IDispatch {
 }
 
 /// An owned reference to a Word automation object, confined to the STA thread.
-pub(super) type Object = ComPtr<IDispatch>;
+pub(in crate::live) type Object = ComPtr<IDispatch>;
 
 impl IDispatch {
     fn ids(&self, names: &[&str]) -> Result<Vec<i32>> {
@@ -182,13 +182,13 @@ impl IDispatch {
     }
 
     /// Read a property.
-    pub(super) fn get(&self, name: &str) -> Result<Variant> {
+    pub(in crate::live) fn get(&self, name: &str) -> Result<Variant> {
         let id = self.ids(&[name])?[0];
         self.invoke(name, DISPATCH_PROPERTYGET, id, vec![], vec![])
     }
 
     /// Assign a property.
-    pub(super) fn put(&self, name: &str, value: Variant) -> Result<()> {
+    pub(in crate::live) fn put(&self, name: &str, value: Variant) -> Result<()> {
         let id = self.ids(&[name])?[0];
         self.invoke(
             name,
@@ -201,13 +201,13 @@ impl IDispatch {
     }
 
     /// Call a method with positional arguments.
-    pub(super) fn call(&self, name: &str, arguments: Vec<Variant>) -> Result<Variant> {
+    pub(in crate::live) fn call(&self, name: &str, arguments: Vec<Variant>) -> Result<Variant> {
         let id = self.ids(&[name])?[0];
         self.invoke(name, DISPATCH_METHOD, id, arguments, vec![])
     }
 
     /// Call a method with named arguments, paired with `arguments` in order.
-    pub(super) fn call_named(
+    pub(in crate::live) fn call_named(
         &self,
         name: &str,
         names: &[&str],
@@ -222,28 +222,28 @@ impl IDispatch {
     }
 
     /// Read an object-valued property.
-    pub(super) fn object(&self, name: &str) -> Result<Object> {
+    pub(in crate::live) fn object(&self, name: &str) -> Result<Object> {
         self.get(name)?
             .into_object()?
             .with_context(|| format!("Word returned no {name} object"))
     }
 
     /// Read an integer property.
-    pub(super) fn int(&self, name: &str) -> Result<i32> {
+    pub(in crate::live) fn int(&self, name: &str) -> Result<i32> {
         self.get(name)?
             .int()
             .with_context(|| format!("Word {name}"))
     }
 
     /// Read a boolean property.
-    pub(super) fn flag(&self, name: &str) -> Result<bool> {
+    pub(in crate::live) fn flag(&self, name: &str) -> Result<bool> {
         self.get(name)?
             .flag()
             .with_context(|| format!("Word {name}"))
     }
 
     /// Read a text property.
-    pub(super) fn string(&self, name: &str) -> Result<String> {
+    pub(in crate::live) fn string(&self, name: &str) -> Result<String> {
         self.get(name)?
             .string()
             .with_context(|| format!("Word {name}"))
@@ -286,7 +286,7 @@ fn adopt(unknown: windows::core::IUnknown) -> Result<Object> {
 
 /// An owned `VARIANT`. `windows` does not clear `VARIANT`s, so this does.
 #[repr(transparent)]
-pub(super) struct Variant(VARIANT);
+pub(in crate::live) struct Variant(VARIANT);
 
 impl Variant {
     fn empty() -> Self {
@@ -308,7 +308,7 @@ impl Variant {
 
     /// Pass a Word object as an argument; the variant owns one added reference.
     #[cfg(test)]
-    pub(super) fn object(object: &Object) -> Self {
+    pub(in crate::live) fn object(object: &Object) -> Self {
         let raw = object.clone().into_raw();
         Self::with(VT_DISPATCH, |member| {
             // SAFETY: `raw` carries the reference added by `clone`; the `windows`
@@ -323,7 +323,7 @@ impl Variant {
         unsafe { self.0.Anonymous.Anonymous.vt }
     }
 
-    pub(super) fn int(&self) -> Result<i32> {
+    pub(in crate::live) fn int(&self) -> Result<i32> {
         // SAFETY: Each arm reads the member that the tag selects.
         unsafe {
             let inner = &self.0.Anonymous.Anonymous.Anonymous;
@@ -337,7 +337,7 @@ impl Variant {
 
     /// Word reports sizes as `Single`, so accept both floating-point types.
     #[cfg(test)]
-    pub(super) fn number(&self) -> Result<f64> {
+    pub(in crate::live) fn number(&self) -> Result<f64> {
         use windows::Win32::System::Variant::VT_R4;
         // SAFETY: Each arm reads the member that the tag selects.
         unsafe {
@@ -350,7 +350,7 @@ impl Variant {
         }
     }
 
-    pub(super) fn flag(&self) -> Result<bool> {
+    pub(in crate::live) fn flag(&self) -> Result<bool> {
         // SAFETY: Each arm reads the member that the tag selects.
         unsafe {
             match self.vt() {
@@ -360,7 +360,7 @@ impl Variant {
         }
     }
 
-    pub(super) fn string(&self) -> Result<String> {
+    pub(in crate::live) fn string(&self) -> Result<String> {
         // SAFETY: Each arm reads the member that the tag selects.
         unsafe {
             match self.vt() {
@@ -371,7 +371,7 @@ impl Variant {
     }
 
     /// Take the object out of the variant; `None` for `Nothing`/empty/null.
-    pub(super) fn into_object(mut self) -> Result<Option<Object>> {
+    pub(in crate::live) fn into_object(mut self) -> Result<Option<Object>> {
         let vt = self.vt();
         // SAFETY: Each arm moves out the interface member that the tag selects and
         // then marks the variant empty, so `Drop` does not release it again.
@@ -436,7 +436,7 @@ impl From<&str> for Variant {
 }
 
 /// Dispatch pending window messages; an STA must pump for Word's callbacks.
-pub(super) fn pump() {
+pub(in crate::live) fn pump() {
     let mut message = MSG::default();
     // SAFETY: `message` is a local, and messages are dispatched on the thread that
     // retrieved them.
@@ -450,10 +450,10 @@ pub(super) fn pump() {
 
 /// A single-threaded COM apartment on the current thread, left on drop. Drop every
 /// [`Object`] first.
-pub(super) struct Apartment(());
+pub(in crate::live) struct Apartment(());
 
 impl Apartment {
-    pub(super) fn enter() -> Result<Self> {
+    pub(in crate::live) fn enter() -> Result<Self> {
         // SAFETY: Called once per thread; paired with `CoUninitialize` in `Drop`.
         unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
             .ok()
@@ -470,13 +470,13 @@ impl Drop for Apartment {
 }
 
 /// Word's registered class, or `None` when desktop Word is not installed.
-pub(super) fn word_class() -> Option<GUID> {
+pub(in crate::live) fn word_class() -> Option<GUID> {
     // SAFETY: The ProgID is a static NUL-terminated string.
     unsafe { CLSIDFromProgID(w!("Word.Application")) }.ok()
 }
 
 /// The running Word instance, or `None` when Word is not running.
-pub(super) fn running_word(class: &GUID) -> Result<Option<Object>> {
+pub(in crate::live) fn running_word(class: &GUID) -> Result<Option<Object>> {
     let mut unknown = None;
     // SAFETY: `class` and `unknown` are valid for the call.
     match unsafe { GetActiveObject(class, None, &raw mut unknown) } {
@@ -487,7 +487,7 @@ pub(super) fn running_word(class: &GUID) -> Result<Option<Object>> {
 }
 
 /// Start a new Word instance.
-pub(super) fn launch_word(class: &GUID) -> Result<Object> {
+pub(in crate::live) fn launch_word(class: &GUID) -> Result<Object> {
     // SAFETY: `class` is Word's registered class and COM is initialized.
     let unknown =
         unsafe { CoCreateInstance::<_, windows::core::IUnknown>(class, None, CLSCTX_LOCAL_SERVER) }

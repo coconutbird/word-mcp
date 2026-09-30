@@ -1,25 +1,44 @@
-//! Word main-document XML parsing into an offset-indexed element tree, and targeted patching.
+#![expect(
+    dead_code,
+    reason = "SCAFFOLD: API for areas under construction; remove once all are used"
+)]
+//! OOXML part parsing into an offset-indexed element tree, and targeted patching.
 //!
 //! The parser records byte offsets for every element so edits replace only the
-//! targeted spans; everything else in the source XML is preserved verbatim.
+//! targeted spans; everything else in the source XML is preserved verbatim. [`Tree`]
+//! handles any package part; [`Document`] adds the main-document view (body and
+//! paragraphs) on top of it.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, ops::Deref};
 
 use anyhow::{Context, Result, bail, ensure};
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 
 /// The `WordprocessingML` main namespace.
 pub(super) const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-/// Largest accepted `word/document.xml`.
+/// Largest accepted XML part.
 pub(super) const MAX_XML: usize = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 128;
 const MAX_ELEMENTS: usize = 250_000;
+
+/// One namespace-qualified attribute.
+#[derive(Clone)]
+pub(super) struct Attribute {
+    /// Index into [`Tree::namespaces`]; `None` for an unqualified attribute.
+    pub(super) ns: Option<u16>,
+    /// Local attribute name.
+    pub(super) name: String,
+    /// Unescaped value.
+    pub(super) value: String,
+}
 
 /// One XML element with the byte offsets of its tags in the source.
 #[derive(Clone)]
 pub(super) struct Node {
     /// Local element name.
     pub(super) name: String,
+    /// Index into [`Tree::namespaces`]; `None` when the element has no namespace.
+    pub(super) ns: Option<u16>,
     /// Whether the element is in the Word namespace.
     pub(super) word: bool,
     /// Offset of the opening `<`.
@@ -35,6 +54,8 @@ pub(super) struct Node {
     pub(super) text: String,
     /// Namespace-resolved Word `w:val` attribute of a Word element.
     pub(super) val: Option<String>,
+    /// Every attribute except namespace declarations.
+    pub(super) attributes: Vec<Attribute>,
 }
 
 impl Node {
@@ -49,60 +70,71 @@ impl Node {
     }
 }
 
-/// A parsed main document part.
-pub(super) struct Document {
-    /// Elements in document order; index 0 is the root.
+/// A parsed XML part: elements in document order, index 0 being the root.
+pub(super) struct Tree {
     pub(super) nodes: Vec<Node>,
-    /// Every `w:p` element in document order, including table paragraphs.
-    pub(super) paragraphs: Vec<usize>,
-    /// The `w:body` element.
-    pub(super) body: usize,
+    /// Namespace URIs referenced by nodes and attributes.
+    pub(super) namespaces: Vec<String>,
 }
 
-impl Document {
-    /// Parse and validate a main document part.
+impl Tree {
+    /// Parse any well-formed XML part within the size, depth, and element limits.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One event loop keeps the offset bookkeeping in a single place"
+    )]
     pub(super) fn parse(xml: &str) -> Result<Self> {
-        ensure!(xml.len() <= MAX_XML, "document XML exceeds size limit");
+        ensure!(xml.len() <= MAX_XML, "XML part exceeds 16 MiB limit");
         let mut reader = NsReader::from_str(xml);
         reader.config_mut().check_end_names = true;
-        let mut nodes: Vec<Node> = Vec::new();
+        let mut tree = Self {
+            nodes: Vec::new(),
+            namespaces: Vec::new(),
+        };
         let mut stack: Vec<usize> = Vec::new();
-        let mut paragraphs = Vec::new();
-        let mut body = None;
         loop {
             let start = usize::try_from(reader.buffer_position())?;
             let (namespace, event) = reader.read_resolved_event()?;
             let word = is_word(&namespace);
+            let ns = if matches!(event, Event::Start(_) | Event::Empty(_)) {
+                tree.intern(&namespace)?
+            } else {
+                None
+            };
             let end = usize::try_from(reader.buffer_position())?;
             match &event {
                 Event::Start(element) | Event::Empty(element) => {
                     ensure!(stack.len() < MAX_DEPTH, "XML nesting exceeds 128 levels");
                     ensure!(
-                        nodes.len() < MAX_ELEMENTS,
+                        tree.nodes.len() < MAX_ELEMENTS,
                         "XML exceeds 250000 element limit"
                     );
                     let name = std::str::from_utf8(element.local_name().as_ref())?.to_owned();
-                    let index = nodes.len();
+                    // `ns` and `word` were resolved above, before the reader moved on.
+                    let mut attributes = Vec::new();
                     let mut val = None;
-                    if word {
-                        match name.as_str() {
-                            "p" => paragraphs.push(index),
-                            "body" => {
-                                ensure!(body.is_none(), "multiple document bodies");
-                                body = Some(index);
-                            }
-                            _ => {}
+                    for attribute in element.attributes() {
+                        let attribute = attribute?;
+                        let (attribute_ns, local) = reader.resolve_attribute(attribute.key);
+                        if matches!(attribute_ns, ResolveResult::Unbound)
+                            && attribute.key.as_ref().starts_with(b"xmlns")
+                        {
+                            continue;
                         }
-                        for attribute in element.attributes() {
-                            let attribute = attribute?;
-                            let (namespace, local) = reader.resolve_attribute(attribute.key);
-                            if is_word(&namespace) && local.as_ref() == b"val" {
-                                val = Some(attribute.unescape_value()?.into_owned());
-                            }
+                        let value = attribute.unescape_value()?.into_owned();
+                        if word && is_word(&attribute_ns) && local.as_ref() == b"val" {
+                            val = Some(value.clone());
                         }
+                        attributes.push(Attribute {
+                            ns: tree.intern(&attribute_ns)?,
+                            name: std::str::from_utf8(local.as_ref())?.to_owned(),
+                            value,
+                        });
                     }
-                    nodes.push(Node {
+                    let index = tree.nodes.len();
+                    tree.nodes.push(Node {
                         name,
+                        ns,
                         word,
                         start,
                         open_end: end,
@@ -111,6 +143,7 @@ impl Document {
                         parent: stack.last().copied(),
                         text: String::new(),
                         val,
+                        attributes,
                     });
                     if matches!(event, Event::Start(_)) {
                         stack.push(index);
@@ -118,19 +151,19 @@ impl Document {
                 }
                 Event::End(_) => {
                     let index = stack.pop().context("unexpected closing XML element")?;
-                    nodes[index].close_start = start;
-                    nodes[index].end = end;
+                    tree.nodes[index].close_start = start;
+                    tree.nodes[index].end = end;
                 }
                 Event::Text(value) => {
                     if let Some(index) = stack.last() {
-                        nodes[*index]
+                        tree.nodes[*index]
                             .text
                             .push_str(&quick_xml::escape::unescape(&value.xml_content()?)?);
                     }
                 }
                 Event::CData(value) => {
                     if let Some(index) = stack.last() {
-                        nodes[*index].text.push_str(&value.xml_content()?);
+                        tree.nodes[*index].text.push_str(&value.xml_content()?);
                     }
                 }
                 Event::DocType(_) => bail!("DOCTYPE declarations are not supported"),
@@ -140,28 +173,81 @@ impl Document {
                     let decoded = quick_xml::escape::unescape(&entity)
                         .context("unsupported XML entity reference")?;
                     if let Some(index) = stack.last() {
-                        nodes[*index].text.push_str(&decoded);
+                        tree.nodes[*index].text.push_str(&decoded);
                     }
                 }
                 _ => {}
             }
         }
         ensure!(stack.is_empty(), "unclosed XML element");
-        let body = body.context("missing Word document body")?;
         ensure!(
-            nodes.first().is_some_and(|node| node.is("document")),
-            "invalid Word document root"
+            !tree.nodes.is_empty()
+                && tree
+                    .nodes
+                    .iter()
+                    .filter(|node| node.parent.is_none())
+                    .count()
+                    == 1,
+            "XML part must have exactly one root element"
         );
-        ensure!(
-            nodes.iter().filter(|node| node.parent.is_none()).count() == 1
-                && nodes[body].parent == Some(0),
-            "invalid Word document structure"
-        );
-        Ok(Self {
-            nodes,
-            paragraphs,
-            body,
-        })
+        Ok(tree)
+    }
+
+    fn intern(&mut self, namespace: &ResolveResult<'_>) -> Result<Option<u16>> {
+        let ResolveResult::Bound(uri) = namespace else {
+            return Ok(None);
+        };
+        let uri = std::str::from_utf8(uri.as_ref())?;
+        if let Some(index) = self.namespaces.iter().position(|known| known == uri) {
+            return Ok(Some(u16::try_from(index)?));
+        }
+        self.namespaces.push(uri.to_owned());
+        Ok(Some(u16::try_from(self.namespaces.len() - 1)?))
+    }
+
+    fn namespace_index(&self, uri: &str) -> Option<u16> {
+        self.namespaces
+            .iter()
+            .position(|known| known == uri)
+            .and_then(|index| u16::try_from(index).ok())
+    }
+
+    /// Whether node `index` is the element `name` in namespace `uri`.
+    pub(super) fn is(&self, index: usize, uri: &str, name: &str) -> bool {
+        let node = &self.nodes[index];
+        node.name == name && node.ns.is_some() && node.ns == self.namespace_index(uri)
+    }
+
+    /// The value of attribute `name` in namespace `uri` (`None` for unqualified).
+    pub(super) fn attr(&self, index: usize, uri: Option<&str>, name: &str) -> Option<&str> {
+        let ns = match uri {
+            Some(uri) => Some(self.namespace_index(uri)?),
+            None => None,
+        };
+        self.nodes[index]
+            .attributes
+            .iter()
+            .find(|attribute| attribute.ns == ns && attribute.name == name)
+            .map(|attribute| attribute.value.as_str())
+    }
+
+    /// The value of the Word-namespace attribute `w:name`.
+    pub(super) fn word_attr(&self, index: usize, name: &str) -> Option<&str> {
+        self.attr(index, Some(WORD_NS), name)
+    }
+
+    /// Every element `name` in namespace `uri`, in document order.
+    pub(super) fn elements<'a>(
+        &'a self,
+        uri: &'a str,
+        name: &'a str,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let ns = self.namespace_index(uri);
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(move |(_, node)| ns.is_some() && node.ns == ns && node.name == name)
+            .map(|(index, _)| index)
     }
 
     /// Strict descendants of `index`, in document order.
@@ -180,6 +266,78 @@ impl Document {
             .map(|index| &self.nodes[index])
     }
 
+    /// The first Word child of `parent` named `name`.
+    pub(super) fn child(&self, parent: usize, name: &str) -> Option<usize> {
+        self.children(parent)
+            .find_map(|(index, node)| node.is(name).then_some(index))
+    }
+
+    /// Direct children of `parent`, in document order.
+    pub(super) fn children(&self, parent: usize) -> impl Iterator<Item = (usize, &Node)> {
+        self.descendants(parent)
+            .filter(move |(_, node)| node.parent == Some(parent))
+    }
+
+    /// The concatenated text of every Word `w:t` inside `index`.
+    pub(super) fn word_text(&self, index: usize) -> String {
+        let mut text = String::new();
+        for (_, node) in self.descendants(index) {
+            match node.name.as_str() {
+                "t" if node.word => text.push_str(&node.text),
+                "tab" if node.word => text.push('\t'),
+                "br" | "cr" if node.word => text.push('\n'),
+                "p" if node.word && !text.is_empty() => text.push('\n'),
+                _ => {}
+            }
+        }
+        text
+    }
+}
+
+/// A parsed main document part.
+pub(super) struct Document {
+    tree: Tree,
+    /// Every `w:p` element in document order, including table paragraphs.
+    pub(super) paragraphs: Vec<usize>,
+    /// The `w:body` element.
+    pub(super) body: usize,
+}
+
+impl Deref for Document {
+    type Target = Tree;
+
+    fn deref(&self) -> &Tree {
+        &self.tree
+    }
+}
+
+impl Document {
+    /// Parse and validate a main document part.
+    pub(super) fn parse(xml: &str) -> Result<Self> {
+        let tree = Tree::parse(xml)?;
+        ensure!(tree.nodes[0].is("document"), "invalid Word document root");
+        let mut body = None;
+        let mut paragraphs = Vec::new();
+        for (index, node) in tree.nodes.iter().enumerate() {
+            if node.is("p") {
+                paragraphs.push(index);
+            } else if node.is("body") {
+                ensure!(body.is_none(), "multiple document bodies");
+                body = Some(index);
+            }
+        }
+        let body = body.context("missing Word document body")?;
+        ensure!(
+            tree.nodes[body].parent == Some(0),
+            "invalid Word document structure"
+        );
+        Ok(Self {
+            tree,
+            paragraphs,
+            body,
+        })
+    }
+
     /// Word descendants of `paragraph` that belong to it rather than a nested paragraph.
     pub(super) fn owned(&self, paragraph: usize) -> impl Iterator<Item = (usize, &Node)> {
         self.descendants(paragraph)
@@ -187,7 +345,7 @@ impl Document {
     }
 
     /// The nearest `w:p` containing or equal to `index`.
-    fn owner(&self, mut index: usize) -> Option<usize> {
+    pub(super) fn owner(&self, mut index: usize) -> Option<usize> {
         loop {
             let node = &self.nodes[index];
             if node.is("p") {
@@ -195,6 +353,11 @@ impl Document {
             }
             index = node.parent?;
         }
+    }
+
+    /// The zero-based paragraph number of the `w:p` element `index`.
+    pub(super) fn paragraph_number(&self, index: usize) -> Option<usize> {
+        self.paragraphs.binary_search(&index).ok()
     }
 
     /// The `w:t` elements carrying the paragraph's text.
@@ -280,18 +443,6 @@ impl Document {
         );
         Ok(())
     }
-
-    /// The first Word child of `parent` named `name`.
-    pub(super) fn child(&self, parent: usize, name: &str) -> Option<usize> {
-        self.children(parent)
-            .find_map(|(index, node)| node.is(name).then_some(index))
-    }
-
-    /// Direct children of `parent`, in document order.
-    pub(super) fn children(&self, parent: usize) -> impl Iterator<Item = (usize, &Node)> {
-        self.descendants(parent)
-            .filter(move |(_, node)| node.parent == Some(parent))
-    }
 }
 
 fn is_word(namespace: &ResolveResult<'_>) -> bool {
@@ -301,8 +452,21 @@ fn is_word(namespace: &ResolveResult<'_>) -> bool {
 /// A replacement of the byte range `start..end` of the source XML.
 pub(super) type Patch = (usize, usize, String);
 
-/// Apply non-overlapping patches and re-parse the result to validate it.
-pub(super) fn patch(xml: &str, mut changes: Vec<Patch>) -> Result<String> {
+/// Apply non-overlapping patches to the main document part and validate the result.
+pub(super) fn patch(xml: &str, changes: Vec<Patch>) -> Result<String> {
+    let result = apply(xml, changes)?;
+    Document::parse(&result)?;
+    Ok(result)
+}
+
+/// Apply non-overlapping patches to any XML part and validate that it still parses.
+pub(super) fn patch_part(xml: &str, changes: Vec<Patch>) -> Result<String> {
+    let result = apply(xml, changes)?;
+    Tree::parse(&result)?;
+    Ok(result)
+}
+
+fn apply(xml: &str, mut changes: Vec<Patch>) -> Result<String> {
     changes.sort_by_key(|change| change.0);
     for pair in changes.windows(2) {
         ensure!(pair[0].1 <= pair[1].0, "overlapping XML edits");
@@ -311,7 +475,6 @@ pub(super) fn patch(xml: &str, mut changes: Vec<Patch>) -> Result<String> {
     for (start, end, replacement) in changes.into_iter().rev() {
         result.replace_range(start..end, &replacement);
     }
-    Document::parse(&result)?;
     Ok(result)
 }
 
@@ -402,6 +565,16 @@ pub(super) fn prepend_child(xml: &str, node: &Node, content: String) -> Result<P
         (node.start, node.end, expand_empty(xml, node, &content)?)
     } else {
         (node.open_end, node.open_end, content)
+    })
+}
+
+/// A patch inserting `content` as the last child of `node`, expanding it when it is
+/// self-closing.
+pub(super) fn append_child(xml: &str, node: &Node, content: String) -> Result<Patch> {
+    Ok(if node.self_closing() {
+        (node.start, node.end, expand_empty(xml, node, &content)?)
+    } else {
+        (node.close_start, node.close_start, content)
     })
 }
 

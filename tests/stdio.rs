@@ -90,28 +90,28 @@ fn mcp_initialization_discovery_and_error_recovery() {
     let mut client = Client::new();
     let discovery = client.request("tools/list", &json!({}));
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    for name in [
-        "create_document",
-        "read_document",
-        "replace_text",
-        "delete_paragraph",
-        "preview_document",
-        "word_live_open",
-        "word_live_close",
-        "word_live_read",
-        "word_live_paragraphs",
-        "word_live_format",
-        "word_live_view",
-        "word_live_export_pdf",
+    for area in [
+        "document",
+        "read",
+        "edit",
+        "format",
+        "table",
+        "review",
+        "layout",
+        "references",
+        "media",
+        "controls",
     ] {
-        assert!(
-            tools.iter().any(|tool| tool["name"] == name),
-            "missing tool {name}"
-        );
+        for name in [format!("docx_{area}"), format!("word_live_{area}")] {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name.as_str()),
+                "missing tool {name}"
+            );
+        }
     }
     let unknown = client.tool("not_a_tool", &json!({}));
     assert_eq!(unknown["error"]["code"], -32602);
-    let invalid = client.tool("read_document", &json!({"not_a_parameter":true}));
+    let invalid = client.tool("docx_read", &json!({"not_a_parameter":true}));
     assert_eq!(invalid["result"]["isError"], true);
     assert!(invalid["result"]["content"][0]["text"].is_string());
     let ping = client.request("ping", &json!({}));
@@ -132,8 +132,17 @@ fn command_line_tool_catalog_is_valid_json() {
     let mut names = std::collections::HashSet::new();
     for tool in tools {
         assert!(names.insert(tool["name"].as_str().unwrap().to_owned()));
-        assert_eq!(tool["inputSchema"]["type"], "object");
-        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        // Clients such as the Anthropic API reject combinators at the schema root.
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                schema.get(keyword).is_none(),
+                "{} has a root {keyword}",
+                tool["name"]
+            );
+        }
     }
 }
 
@@ -155,58 +164,53 @@ fn saved_document_workflow_over_mcp() {
     let path = directory.path().join("report.docx");
     let preview = directory.path().join("report.html");
     let mut client = Client::new();
-    successful_content(&client.tool(
-        "create_document",
-        &json!({
-            "path":path,"paragraphs":["Draft 🦀 report","Revenue <forecast> & actual"]
-        }),
+    let mut call = |tool: &str, operation: Value| {
+        client.tool(tool, &json!({"path": path, "operation": operation}))
+    };
+    successful_content(&call(
+        "docx_document",
+        json!({"action": "create", "paragraphs": ["Draft 🦀 report", "Revenue <forecast> & actual"]}),
     ));
     assert!(path.is_file());
-    let refusal = client.tool("create_document", &json!({"path":path}));
+    let refusal = call("docx_document", json!({"action": "create"}));
     assert_eq!(
         refusal["result"]["isError"], true,
         "creation must not overwrite by default"
     );
-    let read = client.tool("read_document", &json!({"path":path}));
+    let read = call("docx_read", json!({"action": "paragraphs"}));
     assert!(
         successful_content(&read)
             .to_string()
             .contains("Draft 🦀 report")
     );
-    successful_content(&client.tool(
-        "replace_text",
-        &json!({
-            "path":path,"find":"Draft 🦀","replacement":"Final 🦀"
-        }),
+    successful_content(&call(
+        "docx_edit",
+        json!({"action": "replace", "find": "Draft 🦀", "replacement": "Final 🦀"}),
     ));
-    successful_content(&client.tool(
-        "insert_paragraph",
-        &json!({
-            "path":path,"index":1,"text":"Review complete"
-        }),
+    successful_content(&call(
+        "docx_edit",
+        json!({"action": "insert_paragraph", "index": 1, "text": "Review complete"}),
     ));
-    successful_content(&client.tool(
-        "format_paragraph",
-        &json!({
-            "path":path,"index":0,"bold":true,"font_size_pt":18,"alignment":"center"
-        }),
+    successful_content(&call(
+        "docx_format",
+        json!({"action": "paragraph", "index": 0, "bold": true, "font_size_pt": 18, "alignment": "center"}),
     ));
-    let read = client.tool("read_document", &json!({"path":path}));
+    let read = call("docx_read", json!({"action": "paragraphs"}));
     let text = successful_content(&read).to_string();
     assert!(text.contains("Final 🦀 report"));
     assert!(text.contains("Review complete"));
     assert!(!text.contains("Draft 🦀 report"));
-    successful_content(&client.tool("get_document_info", &json!({"path":path})));
-    successful_content(&client.tool(
-        "preview_document",
-        &json!({"path":path,"output_path":preview}),
+    successful_content(&call("docx_document", json!({"action": "info"})));
+    successful_content(&call(
+        "docx_read",
+        json!({"action": "preview", "output_path": preview}),
     ));
     let html = std::fs::read_to_string(&preview).unwrap();
     assert!(html.contains("Final 🦀 report"));
     assert!(html.contains("&lt;forecast&gt;"));
-    let invalid = client.tool(
-        "replace_text",
-        &json!({"path":path,"find":"","replacement":"invalid"}),
+    let invalid = call(
+        "docx_edit",
+        json!({"action": "replace", "find": "", "replacement": "invalid"}),
     );
     assert_eq!(invalid["result"]["isError"], true);
 }

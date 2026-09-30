@@ -1,6 +1,8 @@
 //! MCP tool discovery, serialized dispatch, and error conversion.
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
+use rmcp::model::ContentBlock;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
@@ -11,15 +13,14 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use crate::{docx, live::LiveBackend};
+use crate::{docx, live::LiveBackend, tool::Output};
 
-const INSTRUCTIONS: &str = "Saved-file tools (create_document, read_document, replace_text, insert_paragraph, \
-format_paragraph, delete_paragraph, get_document_info, preview_document) edit .docx files on disk without Word; \
-they create backups and refuse documents that are open in Word. word_live_* tools drive desktop Microsoft Word \
-on Windows: call word_live_open first, then read, edit, and save through Word, including unsaved changes. \
-Paragraph indices of saved-file tools are zero-based; live tools use Word's UTF-16 range positions \
-(see word_live_paragraphs). Live edits stay unsaved until word_live_save. preview_document gives a logical HTML \
-preview; word_live_view and word_live_export_pdf show the real layout. Tools run with the current user's \
+const INSTRUCTIONS: &str = "Tools come in two families, each grouped by area and selected with \
+operation.action. docx_* tools edit saved .docx files without Microsoft Word; every edit keeps a backup, and \
+they refuse documents that are open in Word. word_live_* tools drive desktop Microsoft Word on Windows, \
+including unsaved changes: open the document with word_live_document first, and save it there when done. \
+Saved-file tools address content by zero-based indices (paragraphs include table paragraphs); live tools use \
+Word's UTF-16 range positions, which word_live_read paragraphs reports. Tools run with the current user's \
 file permissions.";
 
 /// The MCP server. Operations run one at a time so concurrent requests cannot
@@ -56,12 +57,7 @@ impl WordServer {
     }
 
     /// Run one tool call to completion on the current thread.
-    ///
-    /// # Errors
-    /// Returns an error for unknown tools, invalid arguments, document failures, or an
-    /// unavailable Word. A failed live edit may be partially applied; its message says
-    /// how to inspect or undo it.
-    pub fn execute(&self, name: &str, arguments: Value) -> anyhow::Result<Value> {
+    fn execute(&self, name: &str, arguments: Value) -> anyhow::Result<Output> {
         anyhow::ensure!(
             self.tools.iter().any(|tool| tool.name == name),
             "unknown tool: {name}"
@@ -127,7 +123,14 @@ impl ServerHandler for WordServer {
         let outcome =
             tokio::task::spawn_blocking(move || server.execute(&request.name, arguments)).await;
         let result = match outcome {
-            Ok(Ok(value)) => CallToolResult::structured(value),
+            Ok(Ok(Output::Json(value))) => CallToolResult::structured(value),
+            Ok(Ok(Output::Image { png, details })) => CallToolResult::success(vec![
+                ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(png),
+                    "image/png",
+                ),
+                ContentBlock::text(details.to_string()),
+            ]),
             Ok(Err(error)) => {
                 CallToolResult::structured_error(json!({"error": format!("{error:#}")}))
             }
