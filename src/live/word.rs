@@ -107,7 +107,6 @@ fn run(jobs: &mpsc::Receiver<Job>) {
 pub(in crate::live) struct Session {
     word: Option<Object>,
     /// Paragraph texts captured by `word_live_read` snapshots, by canonical path.
-    #[expect(dead_code, reason = "SCAFFOLD: used by areas under construction")]
     pub(in crate::live) snapshots: std::collections::HashMap<PathBuf, Vec<String>>,
 }
 
@@ -197,7 +196,6 @@ pub(in crate::live) fn range(document: &IDispatch, start: i32, end: i32) -> Resu
 }
 
 /// The range of zero-based paragraph `index` of the main story.
-#[expect(dead_code, reason = "SCAFFOLD: used by areas under construction")]
 pub(in crate::live) fn paragraph_range(document: &IDispatch, index: usize) -> Result<Object> {
     let paragraphs = document.object("Paragraphs")?;
     let count = paragraphs.int("Count")?;
