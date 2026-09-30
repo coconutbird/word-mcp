@@ -96,7 +96,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cppvtable-abi"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/cppvtable#4de73fba8d55787eb324612cc039fb69bad710ea"
+source = "git+https://github.com/coconutbird/cppvtable#05cca35b90addcafa86c517ccaf7eb61ecc44606"
 dependencies = [
  "cppvtable-macro",
 ]
@@ -104,7 +104,7 @@ dependencies = [
 [[package]]
 name = "cppvtable-com"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/cppvtable#4de73fba8d55787eb324612cc039fb69bad710ea"
+source = "git+https://github.com/coconutbird/cppvtable#05cca35b90addcafa86c517ccaf7eb61ecc44606"
 dependencies = [
  "cppvtable-abi",
  "cppvtable-macro",
@@ -114,7 +114,7 @@ dependencies = [
 [[package]]
 name = "cppvtable-macro"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/cppvtable#4de73fba8d55787eb324612cc039fb69bad710ea"
+source = "git+https://github.com/coconutbird/cppvtable#05cca35b90addcafa86c517ccaf7eb61ecc44606"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1021,6 +1021,7 @@ dependencies = [
  "cppvtable-com",
  "quick-xml",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

@@ -94,8 +94,13 @@ fn mcp_initialization_discovery_and_error_recovery() {
         "create_document",
         "read_document",
         "replace_text",
+        "delete_paragraph",
         "preview_document",
+        "word_live_open",
+        "word_live_close",
         "word_live_read",
+        "word_live_paragraphs",
+        "word_live_format",
         "word_live_view",
         "word_live_export_pdf",
     ] {

@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         [arg] if arg == "--list-tools" => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(WordServer::new()?.tool_definitions())?
+                serde_json::to_string_pretty(WordServer::new().tool_definitions())?
             );
             return Ok(());
         }
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
-    let service = WordServer::new()?.serve(rmcp::transport::stdio()).await?;
+    let service = WordServer::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
