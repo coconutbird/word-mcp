@@ -307,7 +307,6 @@ impl Variant {
     }
 
     /// Pass a Word object as an argument; the variant owns one added reference.
-    #[cfg(test)]
     pub(in crate::live) fn object(object: &Object) -> Self {
         let raw = object.clone().into_raw();
         Self::with(VT_DISPATCH, |member| {

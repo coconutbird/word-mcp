@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
         [] => {}
         [arg] if arg == "--help" || arg == "-h" => {
             println!(
-                "word-mcp {}\n\nLocal Word MCP server (Rust 2024).\n\nUSAGE:\n  word-mcp               Run MCP over stdio\n  word-mcp --list-tools  Print tool definitions as JSON\n  word-mcp --version    Print version\n\nSaved DOCX tools run without Word. Live tools require Windows and desktop Microsoft Word.\nLogs go to stderr; stdout is reserved for MCP. Set RUST_LOG for diagnostics.",
+                "word-mcp {}\n\nLocal Word MCP server (Rust 2024).\n\nUSAGE:\n  word-mcp                  Run MCP over stdio\n  word-mcp --list-tools     Print tool definitions as JSON\n  word-mcp --tools-markdown Print the tool reference as Markdown\n  word-mcp --version        Print version\n\nSaved DOCX tools (docx_*) run without Word. Live tools (word_live_*) require Windows and desktop Microsoft Word.\nLogs go to stderr; stdout is reserved for MCP. Set RUST_LOG for diagnostics.",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
@@ -23,6 +23,13 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(WordServer::new().tool_definitions())?
+            );
+            return Ok(());
+        }
+        [arg] if arg == "--tools-markdown" => {
+            print!(
+                "{}",
+                word_mcp::catalog::markdown(WordServer::new().tool_definitions())
             );
             return Ok(());
         }

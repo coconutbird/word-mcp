@@ -15,10 +15,8 @@ mod automation;
 #[cfg(test)]
 mod docx_compat;
 
-#[cfg(test)]
-pub(in crate::live) use automation::Variant;
 use automation::{Apartment, launch_word, pump, running_word, word_class};
-pub(in crate::live) use automation::{IDispatch, Object};
+pub(in crate::live) use automation::{IDispatch, Object, Variant};
 
 use super::areas::Operation;
 use crate::tool::Output;
