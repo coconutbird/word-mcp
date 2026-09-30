@@ -335,7 +335,6 @@ impl Variant {
     }
 
     /// Word reports sizes as `Single`, so accept both floating-point types.
-    #[cfg(test)]
     pub(in crate::live) fn number(&self) -> Result<f64> {
         use windows::Win32::System::Variant::VT_R4;
         // SAFETY: Each arm reads the member that the tag selects.
